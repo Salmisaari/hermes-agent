@@ -462,6 +462,7 @@ class TestSlackSocketWatchdog:
     async def test_watchdog_reconnects_when_transport_reports_disconnected(self):
         adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
         adapter._socket_watchdog_interval_s = 0.01
+        adapter._socket_connect_grace_s = 0.03
         factory, instances = self._make_fake_handler_factory()
 
         with contextlib.ExitStack() as stack:
@@ -482,6 +483,67 @@ class TestSlackSocketWatchdog:
                 assert len(instances) >= 2, "watchdog did not heal dead transport"
                 assert instances[0].closed is True
                 assert adapter._handler is instances[-1]
+            finally:
+                await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_watchdog_allows_slow_initial_handshake(self, caplog):
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 0.005
+        adapter._socket_connect_grace_s = 1.0
+        factory, instances = self._make_fake_handler_factory()
+        handshake = asyncio.Event()
+
+        class SlowHandler(factory):
+            async def start_async(self):
+                self.client.is_connected = lambda: False
+                await handshake.wait()
+                self.client.is_connected = lambda: True
+                await super().start_async()
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(SlowHandler):
+                stack.enter_context(p)
+            caplog.set_level("INFO", logger=_slack_mod.__name__)
+            try:
+                assert await adapter.connect() is True
+                await asyncio.sleep(0.04)  # several watchdog ticks
+                assert len(instances) == 1
+                assert instances[0].closed is False
+                assert "Socket Mode connected" not in caplog.text
+                handshake.set()
+                await asyncio.sleep(0.04)
+                assert len(instances) == 1
+                assert adapter._socket_transport_verified is True
+                assert caplog.text.count("Socket Mode connected (transport verified)") == 1
+            finally:
+                await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_watchdog_allows_sdk_recovery_and_logs_verified_transition(self, caplog):
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 0.005
+        adapter._socket_connect_grace_s = 1.0
+        factory, instances = self._make_fake_handler_factory()
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(factory):
+                stack.enter_context(p)
+            caplog.set_level("INFO", logger=_slack_mod.__name__)
+            try:
+                assert await adapter.connect() is True
+                await asyncio.sleep(0.02)
+                assert adapter._socket_transport_verified is True
+                instances[0].client.is_connected = lambda: False
+                await asyncio.sleep(0.02)
+                assert adapter._socket_transport_verified is False
+                assert "allowing SDK reconnect" in caplog.text
+                assert len(instances) == 1
+                instances[0].client.is_connected = lambda: True
+                await asyncio.sleep(0.02)
+                assert adapter._socket_transport_verified is True
+                assert adapter._socket_disconnected_since is None
+                assert len(instances) == 1
+                assert caplog.text.count("Socket Mode connected (transport verified)") == 2
             finally:
                 await adapter.disconnect()
 

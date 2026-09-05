@@ -473,6 +473,12 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+        # Slack's API call alone can wait 30 seconds before the websocket
+        # handshake. Let startup and SDK reconnects finish before replacing
+        # the handler, but still recover a transport that stays disconnected.
+        self._socket_connect_grace_s = 60.0
+        self._socket_disconnected_since: Optional[float] = None
+        self._socket_transport_verified = False
 
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
@@ -484,6 +490,8 @@ class SlackAdapter(BasePlatformAdapter):
         )
         _apply_slack_proxy(self._handler.client, self._proxy_url)
 
+        self._socket_disconnected_since = time.monotonic()
+        self._socket_transport_verified = False
         task = asyncio.create_task(self._handler.start_async())
         self._socket_mode_task = task
         task.add_done_callback(self._on_socket_mode_task_done)
@@ -579,8 +587,22 @@ class SlackAdapter(BasePlatformAdapter):
                     continue
 
                 connected = await self._socket_transport_connected()
-                if connected is False:
-                    await self._restart_socket_mode("transport disconnected")
+                if connected is True:
+                    if not self._socket_transport_verified:
+                        logger.info("[Slack] Socket Mode connected (transport verified)")
+                    self._socket_transport_verified = True
+                    self._socket_disconnected_since = None
+                elif connected is False:
+                    now = time.monotonic()
+                    if self._socket_disconnected_since is None:
+                        self._socket_disconnected_since = now
+                        logger.warning(
+                            "[Slack] Socket Mode unhealthy (transport disconnected); "
+                            "allowing SDK reconnect"
+                        )
+                    self._socket_transport_verified = False
+                    if now - self._socket_disconnected_since >= self._socket_connect_grace_s:
+                        await self._restart_socket_mode("transport disconnected after grace period")
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - defensive logging
@@ -1244,7 +1266,7 @@ class SlackAdapter(BasePlatformAdapter):
                 raise
 
             logger.info(
-                "[Slack] Socket Mode connected (%d workspace(s))",
+                "[Slack] Socket Mode starting (%d workspace(s))",
                 len(self._team_clients),
             )
             return True
