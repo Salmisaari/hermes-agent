@@ -14,6 +14,7 @@ from outliving a teardown.
 
 import asyncio
 import sys
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -360,7 +361,7 @@ class TestSocketModeRestart:
 
     @pytest.mark.asyncio
     async def test_watchdog_restarts_when_transport_disconnected(self, adapter):
-        """A transport that reports itself down still triggers a reconnect."""
+        """A transport still down after the SDK recovery grace is restarted."""
         live_task = MagicMock()
         live_task.done.return_value = False
         adapter._socket_mode_task = live_task
@@ -375,7 +376,8 @@ class TestSocketModeRestart:
         adapter._restart_socket_mode = _fake_restart
         adapter._socket_transport_connected = AsyncMock(return_value=False)
         adapter._socket_watchdog_interval_s = 0.01
+        adapter._socket_disconnected_since = time.monotonic() - adapter._socket_connect_grace_s - 1
 
-        await adapter._socket_watchdog_loop()
+        await asyncio.wait_for(adapter._socket_watchdog_loop(), timeout=2)
 
-        assert reasons == ["transport disconnected"]
+        assert reasons == ["transport disconnected after grace period"]
